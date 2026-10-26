@@ -9,8 +9,15 @@
 #   https://drive.google.com/...    Google Drive (pakai gdown)
 #   release:TAG                     asset dari release repo ini (TAG boleh 'latest')
 #   release:TAG/POLA                contoh: release:stock/boot.img
-#   release:OWNER/REPO@TAG/POLA     asset dari release repo lain (publik)
+#   release:OWNER/REPO@TAG/POLA     asset dari release repo lain
 #   path/di/repo                    file yang ada di repo ini
+#
+# Untuk release: bila beberapa asset cocok dengan POLA, dipilih yang PALING BARU di-upload.
+# Beberapa sumber bisa dipisah "||" -> dicoba berurutan, yang pertama berhasil dipakai.
+#
+# RESOLVE_ONLY=1 -> tidak mengunduh, hanya cetak "ID<TAB>NAMA<TAB>WAKTU" asset terpilih
+#                   ("-<TAB>sumber<TAB>-" untuk sumber non-release). Dipakai untuk auto-build.
+# Info asset terpilih juga ditulis ke <folder-tujuan>/asset.env
 #
 # Untuk 'boot', file yang diterima: boot.img, .img.xz/.img.gz, zip/tgz berisi boot.img
 # (mis. ROM fastboot Xiaomi), atau zip ROM / payload.bin (pakai payload-dumper-go).
@@ -20,52 +27,88 @@ log() { printf '[fetch] %s\n' "$*" >&2; }
 die() { printf '[fetch][x] %s\n' "$*" >&2; [ -n "${GITHUB_ACTIONS:-}" ] && echo "::error::$*" >&2; exit 1; }
 
 [ $# -eq 3 ] || die "Pemakaian: $0 <sumber> <folder-tujuan> <kernel|boot>"
-SRC=$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 DEST=$(realpath -m "$2")
 KIND=$3
-[ -n "$SRC" ] || die "Sumber $KIND kosong"
 case "$KIND" in kernel|boot) ;; *) die "Jenis harus kernel atau boot" ;; esac
+trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+mapfile -t ALTS < <(printf '%s\n' "$1" | sed 's/[[:space:]]*||[[:space:]]*/\n/g')
 
 DL="$DEST/dl"
-rm -rf "$DL"; mkdir -p "$DL"
-
 newest() { find "$1" -maxdepth 1 -type f -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-; }
 
+# resolve_release <spec tanpa "release:"> -> set R_REPO R_TAG R_ID R_NAME R_TIME
+resolve_release() {
+  local spec=$1 rest pat api json t id name
+  if [[ "$spec" == *@* ]]; then R_REPO=${spec%%@*}; rest=${spec#*@}
+  else R_REPO=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY belum di-set}; rest=$spec; fi
+  R_TAG=${rest%%/*}
+  if [[ "$rest" == */* ]]; then pat=${rest#*/}
+  elif [ "$KIND" = kernel ]; then pat='*.zip'
+  else pat='*boot*'; fi
+  if [ -z "$R_TAG" ] || [ "$R_TAG" = latest ]; then api="repos/$R_REPO/releases/latest"
+  else api="repos/$R_REPO/releases/tags/$R_TAG"; fi
+  json=$(gh api "$api" 2>/dev/null) || { log "Release tidak ditemukan: $R_REPO tag=${R_TAG:-latest}"; return 1; }
+  R_ID=""; R_NAME=""; R_TIME=""
+  while IFS=$'\t' read -r t id name; do
+    # shellcheck disable=SC2053
+    [[ "$name" == $pat ]] || continue
+    if [ -z "$R_TIME" ] || [[ "$t" > "$R_TIME" ]]; then R_TIME=$t; R_ID=$id; R_NAME=$name; fi
+  done < <(jq -r '.assets[] | [.updated_at, (.id|tostring), .name] | @tsv' <<<"$json")
+  [ -n "$R_ID" ] || { log "Tidak ada asset cocok '$pat' di $R_REPO tag=${R_TAG:-latest}"; return 1; }
+  log "Asset terpilih: $R_NAME (id $R_ID, $R_TIME) dari $R_REPO@${R_TAG:-latest}"
+}
+
+# fetch_one <sumber> -> set FILE, ASSET_*; return 1 bila gagal
+fetch_one() {
+  local src=$1 p
+  rm -rf "$DL"; mkdir -p "$DL"
+  ASSET_ID=-; ASSET_NAME=$src; ASSET_TIME=-; ASSET_REPO=-
+  case "$src" in
+    http://*drive.google.com*|https://*drive.google.com*|https://drive.usercontent.google.com*)
+      log "Unduh dari Google Drive"
+      command -v gdown >/dev/null || pip install -q gdown >&2
+      gdown --fuzzy -q "$src" -O "$DL/" >&2 || { log "Gagal unduh dari Google Drive (link harus 'Siapa saja yang memiliki link')"; return 1; } ;;
+    http://*|https://*)
+      log "Unduh: $src"
+      (cd "$DL" && curl -fSL --retry 3 --retry-delay 5 -OJ "$src" >&2) || { log "Gagal unduh $src"; return 1; } ;;
+    release:*)
+      resolve_release "${src#release:}" || return 1
+      gh api -H "Accept: application/octet-stream" "repos/$R_REPO/releases/assets/$R_ID" > "$DL/$R_NAME" \
+        || { log "Gagal unduh asset $R_NAME"; return 1; }
+      ASSET_ID=$R_ID; ASSET_NAME=$R_NAME; ASSET_TIME=$R_TIME; ASSET_REPO=$R_REPO ;;
+    *)
+      p=${GITHUB_WORKSPACE:-.}/$src
+      [ -f "$p" ] || p=$src
+      [ -f "$p" ] || { log "File tidak ditemukan di repo: $src"; return 1; }
+      cp "$p" "$DL/" ;;
+  esac
+  FILE=$(newest "$DL")
+  [ -n "${FILE:-}" ] && [ -s "$FILE" ] || { log "File $KIND hasil unduhan kosong"; return 1; }
+}
+
+# ------------------------------------------------------------------ mode cek saja
+if [ "${RESOLVE_ONLY:-0}" = 1 ]; then
+  for a in "${ALTS[@]}"; do
+    a=$(trim "$a"); [ -n "$a" ] || continue
+    case "$a" in
+      release:*) resolve_release "${a#release:}" && { printf '%s\t%s\t%s\n' "$R_ID" "$R_NAME" "$R_TIME"; exit 0; } ;;
+      http://*|https://*) printf -- '-\t%s\t-\n' "$a"; exit 0 ;;
+      *) { [ -f "${GITHUB_WORKSPACE:-.}/$a" ] || [ -f "$a" ]; } && { printf -- '-\t%s\t-\n' "$a"; exit 0; } ;;
+    esac
+  done
+  log "Tidak ada sumber $KIND yang tersedia: $1"; exit 1
+fi
+
 # ------------------------------------------------------------------ unduh
-case "$SRC" in
-  http://*drive.google.com*|https://*drive.google.com*|https://drive.usercontent.google.com*)
-    log "Unduh dari Google Drive"
-    command -v gdown >/dev/null || pip install -q gdown >&2
-    gdown --fuzzy -q "$SRC" -O "$DL/" >&2 || die "Gagal unduh dari Google Drive (pastikan link dibagikan 'Siapa saja yang memiliki link')"
-    FILE=$(newest "$DL") ;;
-  http://*|https://*)
-    log "Unduh: $SRC"
-    (cd "$DL" && curl -fSL --retry 3 --retry-delay 5 -OJ "$SRC" >&2) || die "Gagal unduh $SRC"
-    FILE=$(newest "$DL") ;;
-  release:*)
-    spec=${SRC#release:}
-    if [[ "$spec" == *@* ]]; then repo=${spec%%@*}; rest=${spec#*@}
-    else repo=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY belum di-set}; rest=$spec; fi
-    tag=${rest%%/*}
-    if [[ "$rest" == */* ]]; then pat=${rest#*/}
-    elif [ "$KIND" = kernel ]; then pat='*.zip'
-    else pat='*boot*'; fi
-    log "Unduh asset release $repo tag=$tag pola=$pat"
-    args=(-R "$repo" -p "$pat" -D "$DL" --clobber)
-    if [ "$tag" = latest ] || [ -z "$tag" ]; then gh release download "${args[@]}" >&2
-    else gh release download "$tag" "${args[@]}" >&2; fi || die "Gagal unduh asset release ($repo $tag $pat)"
-    n=$(find "$DL" -maxdepth 1 -type f | wc -l)
-    [ "$n" -ge 1 ] || die "Tidak ada asset cocok dengan pola '$pat'"
-    [ "$n" -eq 1 ] || log "Ada $n asset cocok, dipakai yang terbaru. Perjelas POLA bila salah."
-    FILE=$(newest "$DL") ;;
-  *)
-    p=${GITHUB_WORKSPACE:-.}/$SRC
-    [ -f "$p" ] || p=$SRC
-    [ -f "$p" ] || die "File tidak ditemukan di repo: $SRC"
-    cp "$p" "$DL/"
-    FILE=$(newest "$DL") ;;
-esac
-[ -n "${FILE:-}" ] && [ -s "$FILE" ] || die "File $KIND hasil unduhan kosong"
+FILE=""
+for a in "${ALTS[@]}"; do
+  a=$(trim "$a"); [ -n "$a" ] || continue
+  if fetch_one "$a"; then break; fi
+  FILE=""
+done
+[ -n "$FILE" ] || die "Semua sumber $KIND gagal: $1"
+mkdir -p "$DEST"
+printf 'ASSET_ID=%q\nASSET_NAME=%q\nASSET_TIME=%q\nASSET_REPO=%q\n' "$ASSET_ID" "$ASSET_NAME" "$ASSET_TIME" "$ASSET_REPO" > "$DEST/asset.env"
 log "Didapat: $(basename "$FILE") ($(stat -c %s "$FILE") byte)"
 
 magic() { head -c 8 "$1" | od -An -tx1 | tr -d ' \n'; }
