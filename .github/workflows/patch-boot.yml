@@ -71,7 +71,7 @@ jobs:
       publish: ${{ steps.r.outputs.publish }}
       mode: ${{ steps.r.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Tentukan sumber & cek zip baru
         id: r
@@ -142,7 +142,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Siapkan tools
         run: |
