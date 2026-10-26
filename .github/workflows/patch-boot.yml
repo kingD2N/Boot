@@ -18,11 +18,12 @@ on:
         default: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
         type: string
       stock_rom:
-        description: "ROM stock resmi sumber boot.img (HyperOS OS2.0.3.0 = versi terakhir, device sudah EOL)"
+        description: "ROM stock resmi sumber boot.img (china = OS2.0.8.0 CN terbaru; global/indonesia = OS2.0.3.0)"
         required: true
-        default: "global"
+        default: "china"
         type: choice
         options:
+          - china       # OS2.0.8.0.ULJCNXM (Redmi K50 Gaming, CN terbaru)
           - global      # OS2.0.3.0.ULJMIXM
           - indonesia   # OS2.0.3.0.ULJIDXM
       boot_img:
@@ -31,7 +32,7 @@ on:
         default: ""
         type: string
       output_name:
-        description: "Nama file hasil (kosong = boot-<nama-zip>.img)"
+        description: "Nama file hasil (kosong = boot-<nama-zip>-<versi stock>.img)"
         required: false
         default: ""
         type: string
@@ -54,12 +55,13 @@ on:
 # Samakan dengan default input di atas bila diubah.
 env:
   AUTO_KERNEL_ZIP: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
-  AUTO_STOCK_ROM: global
+  AUTO_STOCK_ROM: china
   DEVICE: ingres
   # ROM recovery resmi Xiaomi (zip berisi payload.bin). boot diambil lewat HTTP Range (~100 MB).
+  ROM_CHINA: "OS2.0.8.0.ULJCNXM/ingres-ota_full-OS2.0.8.0.ULJCNXM-user-14.0-e181db717d.zip"
   ROM_GLOBAL: "OS2.0.3.0.ULJMIXM/ingres_global-ota_full-OS2.0.3.0.ULJMIXM-user-14.0-b7c6438dbb.zip"
   ROM_INDONESIA: "OS2.0.3.0.ULJIDXM/ingres_id_global-ota_full-OS2.0.3.0.ULJIDXM-user-14.0-4c53c72437.zip"
-  ROM_MIRRORS: "bigota.d.miui.com cdnorg.d.miui.com bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"
+  ROM_MIRRORS: "bigota.d.miui.com hugeota.d.miui.com cdnorg.d.miui.com bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"
   # Dipakai bila semua mirror Xiaomi gagal
   BOOT_FALLBACK: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
 
@@ -101,7 +103,7 @@ jobs:
           rom_chain() {  # rantai mirror ROM resmi + cadangan upload manual
             local f out=""
             case "$1" in
-              global) f=$ROM_GLOBAL ;; indonesia) f=$ROM_INDONESIA ;;
+              china) f=$ROM_CHINA ;; global) f=$ROM_GLOBAL ;; indonesia) f=$ROM_INDONESIA ;;
               *) echo "::error::stock_rom tidak dikenal: $1"; exit 1 ;;
             esac
             for h in $ROM_MIRRORS; do out+="https://$h/$f || "; done
