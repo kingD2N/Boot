@@ -1,0 +1,152 @@
+name: Patch Kernel Zip -> boot.img
+
+# Menggabungkan kernel dari zip AnyKernel3 ke boot.img stock dan
+# menghasilkan boot.img siap flash (fastboot flash boot boot.img).
+# Dijalankan manual dari tab Actions -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_zip:
+        description: "Zip kernel AnyKernel3: link https / link Google Drive / release:TAG/POLA / path di repo"
+        required: true
+        type: string
+      boot_img:
+        description: "boot.img stock: link / release:TAG/POLA / path di repo (boleh boot.img, .xz, .zip, ROM fastboot .tgz, zip ROM payload.bin)"
+        required: true
+        default: "release:stock/boot.img"
+        type: string
+      output_name:
+        description: "Nama file hasil (kosong = boot-<nama-zip>.img)"
+        required: false
+        default: ""
+        type: string
+      magisk_version:
+        description: "Versi Magisk sumber magiskboot (latest atau tag, mis. v30.2)"
+        required: false
+        default: "latest"
+        type: string
+      publish_release:
+        description: "Upload hasil ke GitHub Release (mudah diunduh dari HP)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patch-boot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEVICE: ingres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Siapkan tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip xz-utils binutils >/dev/null
+          chmod +x scripts/*.sh
+
+      - name: Ambil magiskboot (dari APK Magisk resmi)
+        env:
+          MAGISK_VERSION: ${{ inputs.magisk_version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/magisk" "$HOME/bin"
+          if [ "$MAGISK_VERSION" = latest ] || [ -z "$MAGISK_VERSION" ]; then
+            gh release download -R topjohnwu/Magisk -p 'Magisk-*.apk' -D "$RUNNER_TEMP/magisk"
+          else
+            gh release download "$MAGISK_VERSION" -R topjohnwu/Magisk -p 'Magisk-*.apk' -D "$RUNNER_TEMP/magisk"
+          fi
+          APK=$(ls "$RUNNER_TEMP"/magisk/*.apk | head -n1)
+          echo "APK: $(basename "$APK")"
+          unzip -p "$APK" lib/x86_64/libmagiskboot.so > "$HOME/bin/magiskboot"
+          chmod +x "$HOME/bin/magiskboot"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          echo "MAGISKBOOT=$HOME/bin/magiskboot" >> "$GITHUB_ENV"
+
+      - name: Unduh zip kernel
+        id: kzip
+        env:
+          SRC: ${{ inputs.kernel_zip }}
+        run: |
+          f=$(scripts/fetch_input.sh "$SRC" "$RUNNER_TEMP/in/kernel" kernel)
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+          echo "Zip kernel: $(basename "$f")"
+          unzip -l "$f"
+
+      - name: Unduh boot.img stock
+        id: stock
+        env:
+          SRC: ${{ inputs.boot_img }}
+        run: |
+          f=$(scripts/fetch_input.sh "$SRC" "$RUNNER_TEMP/in/boot" boot)
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+          ls -l "$f"
+
+      - name: Patch boot.img
+        id: patch
+        env:
+          OUTNAME: ${{ inputs.output_name }}
+          KFILE: ${{ steps.kzip.outputs.file }}
+          BFILE: ${{ steps.stock.outputs.file }}
+        run: |
+          N="$OUTNAME"
+          if [ -n "$N" ]; then case "$N" in *.img) ;; *) N="$N.img";; esac; fi
+          scripts/patch_boot.sh "$KFILE" "$BFILE" out "$N"
+          echo "----- info.txt -----"
+          cat out/info.txt
+          echo "tag=boot-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.patch.outputs.tag }}
+          path: out/*
+          compression-level: 6
+
+      - name: Publish ke GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          TAG: ${{ steps.patch.outputs.tag }}
+          KSTR: ${{ steps.patch.outputs.kernel_string }}
+          KZIP: ${{ inputs.kernel_zip }}
+        run: |
+          TITLE="boot.img #${{ github.run_number }}${KSTR:+ - $KSTR}"
+          {
+            echo "boot.img hasil gabungan zip kernel AnyKernel3 + boot.img stock untuk **${DEVICE}**."
+            echo
+            echo "Sumber zip: \`$KZIP\`"
+            echo
+            echo '```'
+            cat out/info.txt
+            echo '```'
+            echo
+            echo "Flash: \`fastboot flash boot ${{ steps.patch.outputs.boot_name }}\` (atau Install Image -> Boot di TWRP/OrangeFox)."
+            if ls out/dtbo*.img >/dev/null 2>&1; then
+              echo
+              echo "Zip ini juga membawa dtbo: \`fastboot flash dtbo dtbo.img\`."
+            fi
+          } > notes.md
+          gh release create "$TAG" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file notes.md
+          echo "### ✅ Rilis: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ringkasan
+        if: always()
+        run: |
+          {
+            echo "### Patch boot.img"
+            [ -f out/info.txt ] && { echo '```'; cat out/info.txt; echo '```'; } || echo "Gagal — lihat log step di atas."
+          } >> "$GITHUB_STEP_SUMMARY"
