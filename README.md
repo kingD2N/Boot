@@ -8,17 +8,18 @@ Default untuk **POCO F4 GT (ingres)**, tapi skripnya bekerja untuk boot.img GKI 
 
 - **Zip kernel:** zip **terbaru** (berdasarkan waktu upload) di release
   [`kingD2N/ALL-PROJECT-D2N` → `HyperOS_4`](https://github.com/kingD2N/ALL-PROJECT-D2N/releases/tag/HyperOS_4).
-- **boot.img stock:** diambil langsung dari **ROM recovery resmi Xiaomi HyperOS OS2.0.3.0**
-  (versi terakhir; POCO F4 GT sudah EOL):
+- **boot.img stock:** diambil langsung dari **ROM recovery resmi Xiaomi** versi terakhir
+  (device sudah EOL). Default: **CN terbaru**.
 
   | `stock_rom` | Versi | File ROM |
   |---|---|---|
-  | `global` (default) | OS2.0.3.0.ULJMIXM | `ingres_global-ota_full-OS2.0.3.0.ULJMIXM-user-14.0-b7c6438dbb.zip` |
+  | `china` (default) | OS2.0.8.0.ULJCNXM (Redmi K50 Gaming, Des 2025) | `ingres-ota_full-OS2.0.8.0.ULJCNXM-user-14.0-e181db717d.zip` |
+  | `global` | OS2.0.3.0.ULJMIXM | `ingres_global-ota_full-OS2.0.3.0.ULJMIXM-user-14.0-b7c6438dbb.zip` |
   | `indonesia` | OS2.0.3.0.ULJIDXM | `ingres_id_global-ota_full-OS2.0.3.0.ULJIDXM-user-14.0-4c53c72437.zip` |
 
-  ROM-nya 5,4 GB, tapi **hanya partisi `boot` yang diunduh (~100 MB)** lewat HTTP Range
+  ROM-nya 5–6 GB, tapi **hanya partisi `boot` yang diunduh (~100 MB)** lewat HTTP Range
   (`scripts/ota_boot.py`), lalu diverifikasi SHA-256 terhadap manifest `payload.bin`.
-  Mirror dicoba berurutan: `bigota.d.miui.com` → `cdnorg.d.miui.com` → mirror Aliyun SGP.
+  Mirror dicoba berurutan: `bigota` → `hugeota` → `cdnorg` (`*.d.miui.com`) → mirror Aliyun SGP.
   Kalau semua mirror gagal: `boot.img` di release `stock` repo ini, lalu `*boot*.img` di `HyperOS_4`.
 - **Otomatis:** workflow mengecek release `HyperOS_4` **tiap jam**. Begitu ada zip kernel baru,
   kernel custom langsung dibuat dan dirilis (tag `auto-k<id zip>-b<id boot>`). Zip yang sama
@@ -32,7 +33,7 @@ Ganti sumber otomatis di blok `env:` pada `.github/workflows/patch-boot.yml`
 ## Cara pakai manual
 
 1. Buka tab **Actions → Patch Kernel Zip -> boot.img → Run workflow**.
-2. Pilih `stock_rom` (`global` / `indonesia`), sisanya biarkan default, lalu jalankan.
+2. Pilih `stock_rom` (`china` / `global` / `indonesia`), sisanya biarkan default, lalu jalankan.
 3. Unduh hasil dari **Releases**.
 
 Input lain (opsional):
@@ -51,7 +52,7 @@ Input lain (opsional):
 | `publish_release` | centang = hasil di-upload ke Releases |
 
 Flash hasil: `fastboot flash boot boot-xxx.img` atau TWRP/OrangeFox → Install Image → Boot.
-Pakai boot.img dari versi ROM yang **sama** dengan yang terpasang di HP (pilih `global`/`indonesia` sesuai ROM-mu).
+Pakai boot.img dari versi ROM yang **sama** dengan yang terpasang di HP (pilih `china`/`global`/`indonesia` sesuai ROM-mu).
 
 ## Format sumber yang didukung
 
