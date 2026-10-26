@@ -17,10 +17,18 @@ on:
         required: true
         default: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
         type: string
-      boot_img:
-        description: "boot.img stock: link / release:TAG/POLA / path repo (boleh .img/.xz/.zip/.tgz/payload). Pisah '||' = cadangan"
+      stock_rom:
+        description: "ROM stock resmi sumber boot.img (HyperOS OS2.0.3.0 = versi terakhir, device sudah EOL)"
         required: true
-        default: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
+        default: "global"
+        type: choice
+        options:
+          - global      # OS2.0.3.0.ULJMIXM
+          - indonesia   # OS2.0.3.0.ULJIDXM
+      boot_img:
+        description: "Opsional, menimpa stock_rom: link / release:TAG/POLA / path repo (.img/.xz/.zip/.tgz/payload). Pisah '||' = cadangan"
+        required: false
+        default: ""
         type: string
       output_name:
         description: "Nama file hasil (kosong = boot-<nama-zip>.img)"
@@ -46,8 +54,14 @@ on:
 # Samakan dengan default input di atas bila diubah.
 env:
   AUTO_KERNEL_ZIP: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
-  AUTO_BOOT_IMG: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
+  AUTO_STOCK_ROM: global
   DEVICE: ingres
+  # ROM recovery resmi Xiaomi (zip berisi payload.bin). boot diambil lewat HTTP Range (~100 MB).
+  ROM_GLOBAL: "OS2.0.3.0.ULJMIXM/ingres_global-ota_full-OS2.0.3.0.ULJMIXM-user-14.0-b7c6438dbb.zip"
+  ROM_INDONESIA: "OS2.0.3.0.ULJIDXM/ingres_id_global-ota_full-OS2.0.3.0.ULJIDXM-user-14.0-4c53c72437.zip"
+  ROM_MIRRORS: "bigota.d.miui.com cdnorg.d.miui.com bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"
+  # Dipakai bila semua mirror Xiaomi gagal
+  BOOT_FALLBACK: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
 
 permissions:
   contents: write
@@ -79,15 +93,29 @@ jobs:
           EVENT: ${{ github.event_name }}
           IN_KZIP: ${{ inputs.kernel_zip }}
           IN_BOOT: ${{ inputs.boot_img }}
+          IN_ROM: ${{ inputs.stock_rom }}
           IN_PUB: ${{ inputs.publish_release }}
           RUN_NO: ${{ github.run_number }}
         run: |
           chmod +x scripts/*.sh
+          rom_chain() {  # rantai mirror ROM resmi + cadangan upload manual
+            local f out=""
+            case "$1" in
+              global) f=$ROM_GLOBAL ;; indonesia) f=$ROM_INDONESIA ;;
+              *) echo "::error::stock_rom tidak dikenal: $1"; exit 1 ;;
+            esac
+            for h in $ROM_MIRRORS; do out+="https://$h/$f || "; done
+            printf '%s' "${out}${BOOT_FALLBACK}"
+          }
           if [ "$EVENT" = workflow_dispatch ]; then
-            MODE=manual; K=${IN_KZIP:-$AUTO_KERNEL_ZIP}; B=${IN_BOOT:-$AUTO_BOOT_IMG}; PUB=$IN_PUB
+            MODE=manual; K=${IN_KZIP:-$AUTO_KERNEL_ZIP}; PUB=$IN_PUB
+            ROM=${IN_ROM:-$AUTO_STOCK_ROM}
+            if [ -n "$IN_BOOT" ]; then B=$IN_BOOT; else B=$(rom_chain "$ROM"); fi
           else
-            MODE=auto;   K=$AUTO_KERNEL_ZIP;           B=$AUTO_BOOT_IMG;           PUB=true
+            MODE=auto;   K=$AUTO_KERNEL_ZIP; PUB=true
+            ROM=$AUTO_STOCK_ROM; B=$(rom_chain "$ROM")
           fi
+          echo "Sumber boot.img: $B"
 
           ksel=$(RESOLVE_ONLY=1 scripts/fetch_input.sh "$K" "$RUNNER_TEMP/r/k" kernel) \
             || { echo "::error::Zip kernel tidak ditemukan: $K"; exit 1; }
@@ -101,7 +129,7 @@ jobs:
           else
             bid=none
             if [ "$MODE" = auto ]; then
-              echo "::warning::boot.img stock belum tersedia (upload ke release 'stock' atau ke HyperOS_4). Auto-build dilewati."
+              echo "::warning::boot.img stock tidak tersedia dari sumber mana pun. Auto-build dilewati."
               RUN=false
             else
               echo "::error::boot.img stock tidak ditemukan: $B"; exit 1
@@ -110,8 +138,9 @@ jobs:
 
           if [ "$MODE" = auto ]; then
             # tag unik per kombinasi asset kernel + boot -> zip yang sama tidak dibuat ulang
-            [ "$kid" = - ] && kid=$(printf '%s' "$kname" | sha1sum | cut -c1-10)
-            [ "${bid:-none}" = - ] && bid=$(printf '%s' "$bname" | sha1sum | cut -c1-10)
+            # sumber non-release: pakai nama file (bukan URL) agar ganti mirror tidak memicu build ulang
+            [ "$kid" = - ] && kid=$(basename "${kname%%\?*}" | sha1sum | cut -c1-10)
+            [ "${bid:-none}" = - ] && bid=$(basename "${bname%%\?*}" | sha1sum | cut -c1-10)
             TAG="auto-k${kid}-b${bid}"
             if [ "$RUN" = true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "Sudah pernah dibuat ($TAG) — tidak ada zip baru."
@@ -194,7 +223,13 @@ jobs:
           BFILE: ${{ steps.stock.outputs.file }}
         run: |
           N="$OUTNAME"
-          if [ -n "$N" ]; then case "$N" in *.img) ;; *) N="$N.img";; esac; fi
+          if [ -n "$N" ]; then case "$N" in *.img) ;; *) N="$N.img";; esac
+          else
+            # boot-<nama-zip-kernel>-<versi stock>.img
+            BSRC=$(. "$RUNNER_TEMP/in/boot/asset.env"; echo "$ASSET_NAME")
+            SV=$(grep -oE 'OS[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[A-Z]+' <<< "$BSRC" | head -n1 || true)
+            N="boot-$(basename "$KFILE" .zip)${SV:+-$SV}.img"
+          fi
           scripts/patch_boot.sh "$KFILE" "$BFILE" out "$N"
           echo "----- info.txt -----"
           cat out/info.txt
@@ -214,13 +249,17 @@ jobs:
           KSTR: ${{ steps.patch.outputs.kernel_string }}
           BOOTNAME: ${{ steps.patch.outputs.boot_name }}
         run: |
+          BSRC=$(. "$RUNNER_TEMP/in/boot/asset.env"; echo "$ASSET_NAME")
+          STOCKVER=$(grep -oE 'OS[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[A-Z]+' <<< "$BSRC" | head -n1 || true)
           . "$RUNNER_TEMP/in/kernel/asset.env"
           if [ "$MODE" = auto ]; then PFX="Auto"; else PFX="#${{ github.run_number }}"; fi
-          TITLE="boot.img ${PFX} - ${KSTR:-$ASSET_NAME}"
+          TITLE="Kernel custom ${PFX} - ${KSTR:-$ASSET_NAME}${STOCKVER:+ (stock $STOCKVER)}"
           {
-            echo "boot.img hasil gabungan zip kernel AnyKernel3 + boot.img stock untuk **${DEVICE}** (mode: $MODE)."
+            echo "boot.img **kernel custom berbasis stock** untuk **${DEVICE}** (mode: $MODE):"
+            echo "kernel dari zip AnyKernel3 digabung ke boot.img stock ${STOCKVER:+HyperOS **$STOCKVER**}."
             echo
-            echo "Zip kernel: \`$ASSET_NAME\`${ASSET_REPO:+ dari \`$ASSET_REPO\`}${ASSET_TIME:+ (upload $ASSET_TIME)}"
+            echo "- Zip kernel: \`$ASSET_NAME\`${ASSET_REPO:+ dari \`$ASSET_REPO\`}${ASSET_TIME:+ (upload $ASSET_TIME)}"
+            echo "- boot.img stock: \`$(basename "${BSRC%%\?*}")\`"
             echo
             echo '```'
             cat out/info.txt
