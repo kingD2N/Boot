@@ -20,7 +20,8 @@
 # Info asset terpilih juga ditulis ke <folder-tujuan>/asset.env
 #
 # Untuk 'boot', file yang diterima: boot.img, .img.xz/.img.gz, zip/tgz berisi boot.img
-# (mis. ROM fastboot Xiaomi), atau zip ROM / payload.bin (pakai payload-dumper-go).
+# (mis. ROM fastboot Xiaomi), atau zip ROM / payload.bin (partisi boot dibaca langsung
+# lewat scripts/ota_boot.py; untuk URL .zip cukup unduh ~100 MB via HTTP Range).
 
 set -euo pipefail
 log() { printf '[fetch] %s\n' "$*" >&2; }
@@ -29,6 +30,7 @@ die() { printf '[fetch][x] %s\n' "$*" >&2; [ -n "${GITHUB_ACTIONS:-}" ] && echo 
 [ $# -eq 3 ] || die "Pemakaian: $0 <sumber> <folder-tujuan> <kernel|boot>"
 DEST=$(realpath -m "$2")
 KIND=$3
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 case "$KIND" in kernel|boot) ;; *) die "Jenis harus kernel atau boot" ;; esac
 trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 mapfile -t ALTS < <(printf '%s\n' "$1" | sed 's/[[:space:]]*||[[:space:]]*/\n/g')
@@ -69,8 +71,27 @@ fetch_one() {
       command -v gdown >/dev/null || pip install -q gdown >&2
       gdown --fuzzy -q "$src" -O "$DL/" >&2 || { log "Gagal unduh dari Google Drive (link harus 'Siapa saja yang memiliki link')"; return 1; } ;;
     http://*|https://*)
-      log "Unduh: $src"
-      (cd "$DL" && curl -fSL --retry 3 --retry-delay 5 -OJ "$src" >&2) || { log "Gagal unduh $src"; return 1; } ;;
+      local path=${src%%\?*} rc=0
+      if [ "$KIND" = boot ] && [[ "$path" == *.zip ]]; then
+        # ROM OTA/recovery: ambil partisi boot saja lewat HTTP Range (~100 MB, bukan 5 GB)
+        log "Ambil boot dari ROM OTA via HTTP Range: $src"
+        python3 -I "$SCRIPT_DIR/ota_boot.py" "$src" "$DL/boot.img" >&2 || rc=$?
+        case $rc in
+          0) ;;
+          3|4) log "Range/format tidak didukung (kode $rc) -> unduh penuh"
+               (cd "$DL" && curl -fsSL --retry 3 --retry-delay 5 -OJ "$src" >&2) || { log "Gagal unduh $src"; return 1; } ;;
+          *) log "Gagal ambil boot dari $src (kode $rc)"; return 1 ;;
+        esac
+      elif [ "$KIND" = boot ] && [[ "$path" == *.tgz || "$path" == *.tar.gz ]]; then
+        # ROM fastboot: stream & ambil images/boot.img tanpa menyimpan arsip 6+ GB
+        log "Stream ROM fastboot & ambil images/boot.img: $src"
+        curl -fsSL --retry 3 --retry-delay 5 "$src" \
+          | tar -xzOf - --wildcards '*images/boot.img' > "$DL/boot.img" \
+          || { log "Gagal stream/ekstrak boot.img dari $src"; rm -f "$DL/boot.img"; return 1; }
+      else
+        log "Unduh: $src"
+        (cd "$DL" && curl -fsSL --retry 3 --retry-delay 5 -OJ "$src" >&2) || { log "Gagal unduh $src"; return 1; }
+      fi ;;
     release:*)
       resolve_release "${src#release:}" || return 1
       gh api -H "Accept: application/octet-stream" "repos/$R_REPO/releases/assets/$R_ID" > "$DL/$R_NAME" \
@@ -92,7 +113,12 @@ if [ "${RESOLVE_ONLY:-0}" = 1 ]; then
     a=$(trim "$a"); [ -n "$a" ] || continue
     case "$a" in
       release:*) resolve_release "${a#release:}" && { printf '%s\t%s\t%s\n' "$R_ID" "$R_NAME" "$R_TIME"; exit 0; } ;;
-      http://*|https://*) printf -- '-\t%s\t-\n' "$a"; exit 0 ;;
+      http://*|https://*)
+        # pastikan link hidup (ambil 1 byte); link mati -> coba sumber berikutnya
+        if curl -fsSL -r 0-0 -o /dev/null --max-time 45 --retry 2 "$a" 2>/dev/null; then
+          printf -- '-\t%s\t-\n' "$a"; exit 0
+        fi
+        log "Tidak bisa dijangkau: $a" ;;
       *) { [ -f "${GITHUB_WORKSPACE:-.}/$a" ] || [ -f "$a" ]; } && { printf -- '-\t%s\t-\n' "$a"; exit 0; } ;;
     esac
   done
@@ -121,26 +147,16 @@ if [ "$KIND" = kernel ]; then
 fi
 
 # ------------------------------------------------------------------ boot
-extract_payload() {  # $1 = payload.bin
-  local pd
-  if ! command -v payload-dumper-go >/dev/null; then
-    log "Pasang payload-dumper-go"
-    pd=$(mktemp -d)
-    gh release download -R ssut/payload-dumper-go -p '*linux_amd64.tar.gz' -D "$pd" >&2 \
-      || die "Gagal unduh payload-dumper-go"
-    tar -xzf "$pd"/*.tar.gz -C "$pd"
-    export PATH="$pd:$PATH"
-  fi
-  mkdir -p "$DEST/payload"
-  payload-dumper-go -p boot -o "$DEST/payload" "$1" >&2 || die "Gagal ekstrak boot dari payload.bin"
-  [ -f "$DEST/payload/boot.img" ] || die "payload.bin tidak berisi partisi boot"
-  mv "$DEST/payload/boot.img" "$DEST/boot.img"
+extract_payload() {  # $1 = zip OTA atau payload.bin lokal -> $DEST/boot.img (dibaca langsung, tanpa ekstrak payload)
+  python3 -I "$SCRIPT_DIR/ota_boot.py" "$1" "$DEST/boot.img.new" >&2 || die "Gagal ekstrak partisi boot dari payload"
+  rm -f "$1"
+  mv "$DEST/boot.img.new" "$DEST/boot.img"
 }
 
 OUTB="$DEST/boot.img"
 for _ in 1 2 3; do
   # tar (mis. ROM fastboot Xiaomi .tgz setelah gzip dibuka): "ustar" di offset 257
-  if [ "$(dd if="$FILE" bs=1 skip=257 count=5 2>/dev/null)" = ustar ]; then
+  if [ "$(dd if="$FILE" bs=1 skip=257 count=5 2>/dev/null | tr -d '\0')" = ustar ]; then
     entry=$(tar -tf "$FILE" | grep -E '(^|/)boot\.img$' | head -n1 || true)
     [ -n "$entry" ] || die "Arsip tar tidak berisi boot.img"
     log "Ekstrak $entry dari tar"
@@ -165,9 +181,8 @@ for _ in 1 2 3; do
       fi
       entry=$(printf '%s\n' "$list" | grep -E '(^|/)payload\.bin$' | head -n1 || true)
       if [ -n "$entry" ]; then
-        log "Ekstrak $entry dari zip ROM (bisa lama)"
-        unzip -p "$FILE" "$entry" > "$DEST/payload.bin"; rm -f "$FILE"
-        extract_payload "$DEST/payload.bin"; rm -f "$DEST/payload.bin"; echo "$OUTB"; exit 0
+        log "Ambil partisi boot dari payload.bin di dalam zip ROM"
+        extract_payload "$FILE"; echo "$OUTB"; exit 0
       fi
       die "Zip tidak berisi boot.img maupun payload.bin" ;;
     *) die "Format file boot tidak dikenali (bukan boot.img/zip/xz/gz/payload.bin)" ;;
