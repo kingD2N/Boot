@@ -2,19 +2,25 @@ name: Patch Kernel Zip -> boot.img
 
 # Menggabungkan kernel dari zip AnyKernel3 ke boot.img stock dan
 # menghasilkan boot.img siap flash (fastboot flash boot boot.img).
-# Dijalankan manual dari tab Actions -> "Run workflow".
+#
+# Jalan dengan 3 cara:
+#   - Manual  : tab Actions -> "Run workflow" (input kosong = pakai default di bawah)
+#   - Otomatis: dicek tiap jam; bila ada zip kernel BARU di release sumber,
+#               boot.img langsung dibuat & dirilis (zip yang sama tidak dibuat ulang)
+#   - Dipicu  : repository_dispatch tipe "kernel-updated" (opsional, dari repo lain)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_zip:
-        description: "Zip kernel AnyKernel3: link https / link Google Drive / release:TAG/POLA / path di repo"
+        description: "Zip kernel AnyKernel3 (default: zip TERBARU di ALL-PROJECT-D2N release HyperOS_4)"
         required: true
+        default: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
         type: string
       boot_img:
-        description: "boot.img stock: link / release:TAG/POLA / path di repo (boleh boot.img, .xz, .zip, ROM fastboot .tgz, zip ROM payload.bin)"
+        description: "boot.img stock: link / release:TAG/POLA / path repo (boleh .img/.xz/.zip/.tgz/payload). Pisah '||' = cadangan"
         required: true
-        default: "release:stock/boot.img"
+        default: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
         type: string
       output_name:
         description: "Nama file hasil (kosong = boot-<nama-zip>.img)"
@@ -31,21 +37,109 @@ on:
         required: false
         default: true
         type: boolean
+  schedule:
+    - cron: "23 * * * *"   # tiap jam menit ke-23 (UTC) — cek zip kernel baru
+  repository_dispatch:
+    types: [kernel-updated]
+
+# Sumber untuk mode otomatis (schedule / repository_dispatch).
+# Samakan dengan default input di atas bila diubah.
+env:
+  AUTO_KERNEL_ZIP: "release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*.zip"
+  AUTO_BOOT_IMG: "release:stock/boot.img || release:kingD2N/ALL-PROJECT-D2N@HyperOS_4/*[Bb]oot*.img"
+  DEVICE: ingres
 
 permissions:
   contents: write
 
 concurrency:
-  group: patch-boot-${{ github.ref }}
+  group: patch-boot
   cancel-in-progress: false
 
 jobs:
+  # ------------------------------------------------------------------ cek
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      run: ${{ steps.r.outputs.run }}
+      kernel_zip: ${{ steps.r.outputs.kernel_zip }}
+      boot_img: ${{ steps.r.outputs.boot_img }}
+      tag: ${{ steps.r.outputs.tag }}
+      publish: ${{ steps.r.outputs.publish }}
+      mode: ${{ steps.r.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tentukan sumber & cek zip baru
+        id: r
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_KZIP: ${{ inputs.kernel_zip }}
+          IN_BOOT: ${{ inputs.boot_img }}
+          IN_PUB: ${{ inputs.publish_release }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          chmod +x scripts/*.sh
+          if [ "$EVENT" = workflow_dispatch ]; then
+            MODE=manual; K=${IN_KZIP:-$AUTO_KERNEL_ZIP}; B=${IN_BOOT:-$AUTO_BOOT_IMG}; PUB=$IN_PUB
+          else
+            MODE=auto;   K=$AUTO_KERNEL_ZIP;           B=$AUTO_BOOT_IMG;           PUB=true
+          fi
+
+          ksel=$(RESOLVE_ONLY=1 scripts/fetch_input.sh "$K" "$RUNNER_TEMP/r/k" kernel) \
+            || { echo "::error::Zip kernel tidak ditemukan: $K"; exit 1; }
+          IFS=$'\t' read -r kid kname ktime <<< "$ksel"
+          echo "Zip kernel terpilih: $kname ($ktime)"
+
+          RUN=true
+          if bsel=$(RESOLVE_ONLY=1 scripts/fetch_input.sh "$B" "$RUNNER_TEMP/r/b" boot); then
+            IFS=$'\t' read -r bid bname btime <<< "$bsel"
+            echo "boot.img stock terpilih: $bname"
+          else
+            bid=none
+            if [ "$MODE" = auto ]; then
+              echo "::warning::boot.img stock belum tersedia (upload ke release 'stock' atau ke HyperOS_4). Auto-build dilewati."
+              RUN=false
+            else
+              echo "::error::boot.img stock tidak ditemukan: $B"; exit 1
+            fi
+          fi
+
+          if [ "$MODE" = auto ]; then
+            # tag unik per kombinasi asset kernel + boot -> zip yang sama tidak dibuat ulang
+            [ "$kid" = - ] && kid=$(printf '%s' "$kname" | sha1sum | cut -c1-10)
+            [ "${bid:-none}" = - ] && bid=$(printf '%s' "$bname" | sha1sum | cut -c1-10)
+            TAG="auto-k${kid}-b${bid}"
+            if [ "$RUN" = true ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Sudah pernah dibuat ($TAG) — tidak ada zip baru."
+              RUN=false
+            fi
+          else
+            TAG="boot-$RUN_NO"
+          fi
+
+          {
+            echo "run=$RUN"; echo "mode=$MODE"; echo "tag=$TAG"; echo "publish=$PUB"
+            echo "kernel_zip=$K"; echo "boot_img=$B"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Cek sumber ($MODE)"
+            echo "- Zip kernel: \`$kname\` ($ktime)"
+            echo "- boot.img: \`${bname:-tidak ada}\`"
+            echo "- Build: **$RUN** (tag \`$TAG\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ patch
   patch:
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       GH_TOKEN: ${{ github.token }}
-      DEVICE: ingres
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,12 +147,12 @@ jobs:
       - name: Siapkan tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq unzip xz-utils binutils >/dev/null
+          sudo apt-get install -y -qq unzip xz-utils binutils jq >/dev/null
           chmod +x scripts/*.sh
 
       - name: Ambil magiskboot (dari APK Magisk resmi)
         env:
-          MAGISK_VERSION: ${{ inputs.magisk_version }}
+          MAGISK_VERSION: ${{ inputs.magisk_version || 'latest' }}
         run: |
           mkdir -p "$RUNNER_TEMP/magisk" "$HOME/bin"
           if [ "$MAGISK_VERSION" = latest ] || [ -z "$MAGISK_VERSION" ]; then
@@ -76,7 +170,7 @@ jobs:
       - name: Unduh zip kernel
         id: kzip
         env:
-          SRC: ${{ inputs.kernel_zip }}
+          SRC: ${{ needs.resolve.outputs.kernel_zip }}
         run: |
           f=$(scripts/fetch_input.sh "$SRC" "$RUNNER_TEMP/in/kernel" kernel)
           echo "file=$f" >> "$GITHUB_OUTPUT"
@@ -86,7 +180,7 @@ jobs:
       - name: Unduh boot.img stock
         id: stock
         env:
-          SRC: ${{ inputs.boot_img }}
+          SRC: ${{ needs.resolve.outputs.boot_img }}
         run: |
           f=$(scripts/fetch_input.sh "$SRC" "$RUNNER_TEMP/in/boot" boot)
           echo "file=$f" >> "$GITHUB_OUTPUT"
@@ -104,33 +198,35 @@ jobs:
           scripts/patch_boot.sh "$KFILE" "$BFILE" out "$N"
           echo "----- info.txt -----"
           cat out/info.txt
-          echo "tag=boot-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.patch.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
           path: out/*
           compression-level: 6
 
       - name: Publish ke GitHub Release
-        if: ${{ inputs.publish_release }}
+        if: needs.resolve.outputs.publish == 'true'
         env:
-          TAG: ${{ steps.patch.outputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          MODE: ${{ needs.resolve.outputs.mode }}
           KSTR: ${{ steps.patch.outputs.kernel_string }}
-          KZIP: ${{ inputs.kernel_zip }}
+          BOOTNAME: ${{ steps.patch.outputs.boot_name }}
         run: |
-          TITLE="boot.img #${{ github.run_number }}${KSTR:+ - $KSTR}"
+          . "$RUNNER_TEMP/in/kernel/asset.env"
+          if [ "$MODE" = auto ]; then PFX="Auto"; else PFX="#${{ github.run_number }}"; fi
+          TITLE="boot.img ${PFX} - ${KSTR:-$ASSET_NAME}"
           {
-            echo "boot.img hasil gabungan zip kernel AnyKernel3 + boot.img stock untuk **${DEVICE}**."
+            echo "boot.img hasil gabungan zip kernel AnyKernel3 + boot.img stock untuk **${DEVICE}** (mode: $MODE)."
             echo
-            echo "Sumber zip: \`$KZIP\`"
+            echo "Zip kernel: \`$ASSET_NAME\`${ASSET_REPO:+ dari \`$ASSET_REPO\`}${ASSET_TIME:+ (upload $ASSET_TIME)}"
             echo
             echo '```'
             cat out/info.txt
             echo '```'
             echo
-            echo "Flash: \`fastboot flash boot ${{ steps.patch.outputs.boot_name }}\` (atau Install Image -> Boot di TWRP/OrangeFox)."
+            echo "Flash: \`fastboot flash boot $BOOTNAME\` (atau Install Image -> Boot di TWRP/OrangeFox)."
             if ls out/dtbo*.img >/dev/null 2>&1; then
               echo
               echo "Zip ini juga membawa dtbo: \`fastboot flash dtbo dtbo.img\`."
