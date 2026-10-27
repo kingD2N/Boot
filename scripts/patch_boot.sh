@@ -84,7 +84,7 @@ set -e
 STOCK_KFMT=$(sed -n 's/^KERNEL_FMT[[:space:]]*\[\(.*\)\]/\1/p' "$WORK/unpack.log" | head -n1)
 HDRVER=$(sed -n 's/^HEADER_VER[[:space:]]*\[\(.*\)\]/\1/p' "$WORK/unpack.log" | head -n1)
 log "Header v${HDRVER:-?}, format kernel stock: ${STOCK_KFMT:-raw}"
-OLD_KVER=$(strings kernel 2>/dev/null | grep -m1 '^Linux version ' || true)
+OLD_KVER=$(strings kernel 2>/dev/null | grep -m1 -E '^Linux version [0-9]' || true)
 
 # ---------------------------------------------------------------- 3. ganti kernel
 is_raw_arm64() {  # Image arm64 mentah: magic "ARMd" di offset 0x38
@@ -106,7 +106,7 @@ case "$(basename "$KIMG")" in
 esac
 is_raw_arm64 kernel || warn "Kernel baru tidak terdeteksi sebagai Image arm64 mentah — periksa hasilnya."
 
-NEW_KVER=$(strings kernel 2>/dev/null | grep -m1 '^Linux version ' || true)
+NEW_KVER=$(strings kernel 2>/dev/null | grep -m1 -E '^Linux version [0-9]' || true)
 log "Kernel lama  : ${OLD_KVER:-?}"
 log "Kernel baru  : ${NEW_KVER:-?}"
 
